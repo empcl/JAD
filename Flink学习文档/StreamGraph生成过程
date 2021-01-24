@@ -1,0 +1,1162 @@
+# 介绍
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;用户执行Flink任务的时候，会首先生成StreamGraph，其是根据用户通过Stream API编写的代码生成的用来表示程序的拓扑结构。这篇文章主要阐述调用Stream API的内部实现以及StreamGraph生成的过程。
+	  本文使用的WordCount代码比较简单，由addSource()、flatMap()、keyBy()、sum()、addSink()五个方法组成，如下所示。
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;**<font color='red'>注意：本文使用的Flink版本是1.10。</font>**
+
+```java
+public class WordCountDemo {
+    private static final Logger log = LoggerFactory.getLogger(WordCountDemo.class);
+
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        DataStream<String> sourceStream = env.addSource(new SourceFunction<String>() {
+            private volatile boolean flag = true;
+            private Random random = new Random();
+
+            @Override
+            public void run(SourceContext<String> ctx) throws Exception {
+                while (flag) {
+                    ctx.collect("name" + random.nextInt(10) + "," + "name" + random.nextInt(10));
+                    Thread.sleep(1000);
+                }
+            }
+
+            @Override
+            public void cancel() {
+                this.flag = false;
+            }
+        });
+
+        DataStream<Tuple2<String, Integer>> pairStream = sourceStream.flatMap(new FlatMapFunction<String, Tuple2<String, Integer>>() {
+            @Override
+            public void flatMap(String value, Collector<Tuple2<String, Integer>> ctx) throws Exception {
+                String[] names = value.split(",");
+                for (int i = 0; i < names.length; i++) {
+                    ctx.collect(Tuple2.of(names[i], 1));
+                }
+            }
+        });
+
+        DataStream<Tuple2<String, Integer>> summedStream = pairStream
+                .keyBy(0)
+                .sum(1);
+
+        summedStream.addSink(new SinkFunction<Tuple2<String, Integer>>() {
+            @Override
+            public void invoke(Tuple2<String, Integer> value, Context context) throws Exception {
+                log.info(value.toString());
+            }
+        });
+
+        env.execute();
+    }
+}
+```
+# 源码阅读
+## WordCount中算子源码阅读
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Flink任务的执行，首先需要获得`StreamExecutionEnvironment`执行环境env。当然，这部分内容不是本篇重点，不会具体讲述。主要根据执行环境获得`StreamExecutionEnvironment`对象，并设置默认的并行度。
+```
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;为了更好地、更简洁的阅读源码，我们以每一个调用的API为维度，分别进行阅读、记录。
+### addSource()
+```java
+public <OUT> DataStreamSource<OUT> addSource(SourceFunction<OUT> function, String sourceName, TypeInformation<OUT> typeInfo) {
+
+    if (typeInfo == null && function instanceof ResultTypeQueryable) {
+	typeInfo = ((ResultTypeQueryable<OUT>) function).getProducedType();
+    }
+    if (typeInfo == null) {
+	try {
+	    typeInfo = TypeExtractor.createTypeInfo(SourceFunction.class,
+					function.getClass(), 0, null, null);
+	} catch (final InvalidTypesException e) {
+	    typeInfo = (TypeInformation<OUT>) new MissingTypeInfo(sourceName, e);
+	}
+    }
+
+    boolean isParallel = function instanceof ParallelSourceFunction;
+
+    clean(function);
+
+    final StreamSource<OUT, ?> sourceOperator = new StreamSource<>(function);
+    return new DataStreamSource<>(this, typeInfo, sourceOperator, isParallel, sourceName);
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`addSource()`方法，主要完成以下几件事：
+* [通过TypeExtractor工具类获取当前SourceFunction中的输出数据的数据类型](https://juejin.cn/post/6918364764049522702)。
+* 根据当前`SourceFunction`是否是实现于`ParallelSourceFunction`接口判断是否需要并行化发送数据。
+* [对function进行清除闭环操作](https://juejin.cn/post/6916925916849373191)。
+* 生成`StreamSource`对象。
+* 构建`DataStreamSource`对象。
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;上述1、3两点在之前的文章已有叙述，这里不再赘述。主要分析4、5两点做的事。
+<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`StreamSource`继承`AbstractUdfStreamOperator`抽象类，其是用户自定义function算子的基类。初始化`StreamSource`对象，实际上也会初始化`AbstractUdfStreamOperator`对象，并且，指定当前算子在flink拓扑中的链接位置（`ChainingStrategy.HEAD`），也会将`function`保存到`AbstractUdfStreamOperator`对象中。
+```java
+/**
+ * {@link StreamOperator} for streaming sources.
+ */
+public class StreamSource<OUT, SRC extends SourceFunction<OUT>> extends AbstractUdfStreamOperator<OUT, SRC> {
+	...
+	public StreamSource(SRC sourceFunction) {
+		super(sourceFunction);
+
+		this.chainingStrategy = ChainingStrategy.HEAD;
+	}
+    ...
+}
+```
+```java
+/**
+ * This is used as the base class for operators that have a user-defined
+ * function. This class handles the opening and closing of the user-defined functions,
+ * as part of the operator life cycle.
+ *
+ * @param <OUT>
+ *            The output type of the operator
+ * @param <F>
+ *            The type of the user function
+ */
+@PublicEvolving
+public abstract class AbstractUdfStreamOperator<OUT, F extends Function>
+		extends AbstractStreamOperator<OUT>
+		implements OutputTypeConfigurable<OUT> {
+    ...
+    /** The user function. */
+    protected final F userFunction;
+
+    public AbstractUdfStreamOperator(F userFunction) {
+	this.userFunction = requireNonNull(userFunction);
+        ...
+    }
+    ...
+}    
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`DataStreamSource`表示flink拓扑的起点，继承`SingleOutputStreamOperator`类，而`SingleOutputStreamOperator`类继承`DataStream`类。初始化`StreamSource`对象，首先会根据`StreamSource`对象`operator`、数据流中的数据类型`outTypeInfo`、并行度等信息生成`SourceTransformation`对象，最后根据`StreamExecutionEnvironment`对象`environment`以及`SourceTransformation`对象生成`DataStream`对象并返回。
+```java
+/**
+ * The DataStreamSource represents the starting point of a DataStream.
+ *
+ * @param <T> Type of the elements in the DataStream created from the this source.
+ */
+@Public
+public class DataStreamSource<T> extends SingleOutputStreamOperator<T> {
+
+    boolean isParallel;
+
+    public DataStreamSource(StreamExecutionEnvironment environment,
+			TypeInformation<T> outTypeInfo, StreamSource<T, ?> operator,
+			boolean isParallel, String sourceName) {
+	super(environment, new SourceTransformation<>(sourceName, operator, outTypeInfo, environment.getParallelism()));
+
+	this.isParallel = isParallel;
+	if (!isParallel) {
+	    setParallelism(1);
+	}
+    }
+    ...
+}
+```
+```java
+/**
+ * {@code SingleOutputStreamOperator} represents a user defined transformation
+ * applied on a {@link DataStream} with one predefined output type.
+ *
+ * @param <T> The type of the elements in this stream.
+ */
+@Public
+public class SingleOutputStreamOperator<T> extends DataStream<T> {
+    ...
+    protected SingleOutputStreamOperator(StreamExecutionEnvironment environment, Transformation<T> transformation) {
+	super(environment, transformation);
+    }
+    ...
+}
+```
+```java
+public class DataStream<T> {
+
+    protected final StreamExecutionEnvironment environment;
+
+    protected final Transformation<T> transformation;
+
+    /**
+     * Create a new {@link DataStream} in the given execution environment with
+     * partitioning set to forward by default.
+     */
+    public DataStream(StreamExecutionEnvironment environment, Transformation<T> transformation) {
+	this.environment = Preconditions.checkNotNull(environment, "Execution Environment must not be null.");
+	this.transformation = Preconditions.checkNotNull(transformation, "Stream Transformation must not be null.");
+    }
+    ...
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`SourceTransformation`类继承`PhysicalTransformation`类，其继承`Transformation`类。`Transformation`类表示创建`DataStream`对象的操作。`Transformation`并不一定与运行时的物理操作相对应，有些操作仅是逻辑概念，如`union`、`split/select`、`partitioning`等。生成`SourceTransformation`对象的时候，首先通过`SimpleOperatorFactory.of(operator)`获得与`operator`类型相对应的用于包裹`StreamOperator`对象`operator`的工厂类并赋值给`SourceTransformation`对象的实例`operatorFactory`，最后生成`Transformation`对象。`Transformation`对象会初始化`id`，`name`，`outputType`，`parallelism`，`slotSharingGroup`等当前算子的实际值。
+```java
+public class SourceTransformation<T> extends PhysicalTransformation<T> {
+
+    private final StreamOperatorFactory<T> operatorFactory;
+
+    /**
+     * Creates a new {@code SourceTransformation} from the given operator.
+     *
+     * @param name The name of the {@code SourceTransformation}, this will be shown in Visualizations and the Log
+     * @param operator The {@code StreamSource} that is the operator of this Transformation
+     * @param outputType The type of the elements produced by this {@code SourceTransformation}
+     * @param parallelism The parallelism of this {@code SourceTransformation}
+     */
+    public SourceTransformation(
+        String name,
+        StreamSource<T, ?> operator,
+        TypeInformation<T> outputType,
+        int parallelism) {
+            this(name, SimpleOperatorFactory.of(operator), outputType, parallelism);
+    }
+
+    public SourceTransformation(
+        String name,
+        StreamOperatorFactory<T> operatorFactory,
+        TypeInformation<T> outputType,
+        int parallelism) {
+            super(name, outputType, parallelism);
+            this.operatorFactory = operatorFactory;
+    }
+    ...
+}
+```
+```java
+/**
+ * A {@link Transformation} that creates a physical operation. It enables setting {@link ChainingStrategy}.
+ *
+ * @param <T> The type of the elements that result from this {@code Transformation}
+ * @see Transformation
+ */
+@Internal
+public abstract class PhysicalTransformation<T> extends Transformation<T> {
+
+    /**
+     * Creates a new {@code Transformation} with the given name, output type and parallelism.
+     *
+     * @param name The name of the {@code Transformation}, this will be shown in Visualizations and the Log
+     * @param outputType The output type of this {@code Transformation}
+     * @param parallelism The parallelism of this {@code Transformation}
+     */
+    PhysicalTransformation(
+        String name,
+        TypeInformation<T> outputType,
+        int parallelism) {
+            super(name, outputType, parallelism);
+    }
+    ...
+}
+```
+```java
+/**
+ * A {@code Transformation} represents the operation that creates a
+ * DataStream. Every DataStream has an underlying
+ * {@code Transformation} that is the origin of said DataStream.
+ *
+ * <p>API operations such as DataStream#map create
+ * a tree of {@code Transformation}s underneath. When the stream program is to be executed
+ * this graph is translated to a StreamGraph using StreamGraphGenerator.
+ *
+ * <p>A {@code Transformation} does not necessarily correspond to a physical operation
+ * at runtime. Some operations are only logical concepts. Examples of this are union,
+ * split/select data stream, partitioning.
+ *
+ * <p>The following graph of {@code Transformations}:
+ * <pre>{@code
+ *   Source              Source
+ *      +                   +
+ *      |                   |
+ *      v                   v
+ *  Rebalance          HashPartition
+ *      +                   +
+ *      |                   |
+ *      |                   |
+ *      +------>Union<------+
+ *                +
+ *                |
+ *                v
+ *              Split
+ *                +
+ *                |
+ *                v
+ *              Select
+ *                +
+ *                v
+ *               Map
+ *                +
+ *                |
+ *                v
+ *              Sink
+ * }</pre>
+ *
+ * <p>Would result in this graph of operations at runtime:
+ * <pre>{@code
+ *  Source              Source
+ *    +                   +
+ *    |                   |
+ *    |                   |
+ *    +------->Map<-------+
+ *              +
+ *              |
+ *              v
+ *             Sink
+ * }</pre>
+ *
+ * <p>The information about partitioning, union, split/select end up being encoded in the edges
+ * that connect the sources to the map operation.
+ *
+ * @param <T> The type of the elements that result from this {@code Transformation}
+ */
+@Internal
+public abstract class Transformation<T> {
+    ...
+    /**
+     * Creates a new {@code Transformation} with the given name, output type and parallelism.
+     *
+     * @param name The name of the {@code Transformation}, this will be shown in Visualizations and the Log
+     * @param outputType The output type of this {@code Transformation}
+     * @param parallelism The parallelism of this {@code Transformation}
+     */
+    public Transformation(String name, TypeInformation<T> outputType, int parallelism) {
+        this.id = getNewNodeId();
+        this.name = Preconditions.checkNotNull(name);
+        this.outputType = outputType;
+        this.parallelism = parallelism;
+        this.slotSharingGroup = null;
+    }
+    ...
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`SimpleOperatorFactory.of(operator)`对象的实现比较简单，主要根据`operator`变量类型获得对应的`SimpleOperatorFactory`实例。以当前WordCount任务为例，此处会初始化`SimpleUdfStreamOperatorFactory`实例，并且分别将当前`operator`变量赋值给其`operator`变量及其父类的`operator`变量。
+```java
+public class SimpleOperatorFactory<OUT> implements StreamOperatorFactory<OUT> {
+
+    private final StreamOperator<OUT> operator;
+
+    /**
+     * Create a SimpleOperatorFactory from existed StreamOperator.
+     */
+    @SuppressWarnings("unchecked")
+    public static <OUT> SimpleOperatorFactory<OUT> of(StreamOperator<OUT> operator) {
+        if (operator == null) {
+            return null;
+        } else if (operator instanceof StreamSource &&
+            ((StreamSource) operator).getUserFunction() instanceof InputFormatSourceFunction) {
+            return new SimpleInputFormatOperatorFactory<OUT>((StreamSource) operator);
+        } else if (operator instanceof StreamSink &&
+            ((StreamSink) operator).getUserFunction() instanceof OutputFormatSinkFunction) {    
+            return new SimpleOutputFormatOperatorFactory<>((StreamSink) operator);
+        } else if (operator instanceof AbstractUdfStreamOperator) { // 执行这里
+            return new SimpleUdfStreamOperatorFactory<OUT>((AbstractUdfStreamOperator) operator);
+        } else {
+            return new SimpleOperatorFactory<>(operator);
+        }
+    }
+    ...
+ }
+```
+```java
+public class SimpleUdfStreamOperatorFactory<OUT> extends SimpleOperatorFactory<OUT> implements UdfStreamOperatorFactory<OUT> {
+
+   private final AbstractUdfStreamOperator<OUT, ?> operator;
+
+   public SimpleUdfStreamOperatorFactory(AbstractUdfStreamOperator<OUT, ?> operator) {
+	super(operator); 
+	this.operator = operator;
+   }
+    ...
+}
+```
+> AbstractUdfStreamOperator 与 SingleOutputStreamOperator的区分？乍一看，两个变量名很相似，但是，分别实现着不同的功能。AbstractUdfStreamOperator类主要用于保存userFunction变量，以及调用userFunction变量的open和close、以及initializeState、snapshotState等重要的方法。SingleOutputStreamOperator类继承DataStream类，flink中很多api返回值都是该类的实例，如flatMap、map、process等方法。
+
+### flatMap()
+```java
+public <R> SingleOutputStreamOperator<R> flatMap(FlatMapFunction<T, R> flatMapper) {
+
+   TypeInformation<R> outType = TypeExtractor.getFlatMapReturnTypes(clean(flatMapper),
+getType(), Utils.getCallLocationName(), true);
+
+   return flatMap(flatMapper, outType);
+}
+
+public <R> SingleOutputStreamOperator<R> flatMap(FlatMapFunction<T, R> flatMapper, TypeInformation<R> outputType) {
+    return transform("Flat Map", outputType, new StreamFlatMap<>(clean(flatMapper)));
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`flatMap()`方法主要完成如下几件事：
+* [通过TypeExtractor工具类获取当前FlatMapFunction中的输出数据的数据类型](https://juejin.cn/post/6918364764049522702)
+* 根据flatMapper变量生成StreamFlatMap对象。
+* 调用`transform()`方法完成赋值`AbstractUdfStreamOperator#userFunction`变量、生成`Transformation`实例、初始化`DataStream`等重要工作工作。
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`StreamFlatMap`类继承`AbstractUdfStreamOperator`并实现`OneInputStreamOperator`接口，与初始化`StreamSource`实例相似,将`flatMapper`变量赋值给`userFunction`变量，设置`chainingStrategy`为`ChainingStrategy.ALWAYS`，这里不做赘述。
+```java
+/**
+ * A {@link StreamOperator} for executing {@link FlatMapFunction FlatMapFunctions}.
+ */
+@Internal
+public class StreamFlatMap<IN, OUT>
+		extends AbstractUdfStreamOperator<OUT, FlatMapFunction<IN, OUT>>
+		implements OneInputStreamOperator<IN, OUT> {
+    ...
+    public StreamFlatMap(FlatMapFunction<IN, OUT> flatMapper) {
+	super(flatMapper);
+	chainingStrategy = ChainingStrategy.ALWAYS;
+    }
+    ...
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;这里我们重点阅读`transform()`方法，跟着源码一起进入底层api世界。首先，初始化包裹`operator`变量的实例`SimpleOperatorFactory`，`addSource()`小段里面有详细介绍，这里不做赘述，然后作为参数传入`doTransform()`方法。
+```java
+public <R> SingleOutputStreamOperator<R> transform(
+			String operatorName,
+			TypeInformation<R> outTypeInfo,
+			OneInputStreamOperator<T, R> operator) {
+
+    return doTransform(operatorName, outTypeInfo, SimpleOperatorFactory.of(operator));
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`doTransform()`实现结构比较清晰、明确。为了方便描述，部分解释直接在源码中进行说明。`OneInputTransformation` 继承 `PhysicalTransformation` 类，间接继承 `Transformation` 类。与其他`Transformation`不同的是，`OneInputTransformation`类包含了指定上游`Transformation`实例的`input`字段，在初始化的时候进行赋值。紧接着，根据`environment`变量、`resultTransform`变量初始化`SingleOutputStreamOperator`实例，即为当前 `flatMap` 算子生成 `DataStream` 。每一个算子底层都会生成一个 `transformation` 变量，`StreamExecutionEnvironment`实例提供数据类型是`ArrayList<Transformation<?>>`的变量 `transformations`，用于保存某些算子底层生成的`transformation`变量，在执行`execute()`方法时候调用执行以生成StreamGraph。
+```java
+protected <R> SingleOutputStreamOperator<R> doTransform(
+                        String operatorName,
+                        TypeInformation<R> outTypeInfo,
+                        StreamOperatorFactory<R> operatorFactory) {
+
+    // 当前transformation表示上一个算子的Transformation实例，用来检查上一个算子的数据输出类型能否正确推断出来
+    transformation.getOutputType();
+    
+    OneInputTransformation<T, R> resultTransform = new OneInputTransformation<>(
+                        this.transformation,
+                        operatorName,
+                        operatorFactory,
+                        outTypeInfo,
+                        environment.getParallelism());
+
+    SingleOutputStreamOperator<R> returnStream = new SingleOutputStreamOperator(environment, resultTransform);
+
+    getExecutionEnvironment().addOperator(resultTransform);
+
+    return returnStream;
+}
+```
+```java
+/**
+ * This Transformation represents the application of a
+ * {@link org.apache.flink.streaming.api.operators.OneInputStreamOperator} to one input
+ * {@link Transformation}.
+ *
+ * @param <IN> The type of the elements in the input {@code Transformation}
+ * @param <OUT> The type of the elements that result from this {@code OneInputTransformation}
+ */
+@Internal
+public class OneInputTransformation<IN, OUT> extends PhysicalTransformation<OUT> {
+
+    private final Transformation<IN> input;
+    ...
+    public OneInputTransformation(
+		Transformation<IN> input,
+		String name,
+		StreamOperatorFactory<OUT> operatorFactory,
+		TypeInformation<OUT> outputType,
+		int parallelism) {
+	super(name, outputType, parallelism);
+	this.input = input;
+	this.operatorFactory = operatorFactory;
+    }
+    ...
+}
+```
+### keyBy()
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`keyBy()`我们着重阅读初始化  `PartitionTransformation` 实例、生成 `KeyedStream`对象方面，其他方面，如生成 `KeySelector` 、`KeyGroupStreamPartitioner` 等跟 `keyBy` 特性相关的代码细节，与生成拓扑图StreamGraph没有必然的联系，我们这里不做介绍，对于这方面的内容，读者可以参考这篇文章[Flink KeyBy源码分析](https://juejin.cn/post/6918640361040510984)。
+```java
+public KeyedStream<T, Tuple> keyBy(int... fields) {
+    if (getType() instanceof BasicArrayTypeInfo || getType() instanceof PrimitiveArrayTypeInfo) {
+	return keyBy(KeySelectorUtil.getSelectorForArray(fields, getType()));
+    } else {
+        return keyBy(new Keys.ExpressionKeys<>(fields, getType()));
+    }
+}
+
+private KeyedStream<T, Tuple> keyBy(Keys<T> keys) {
+    return new KeyedStream<>(this, clean(KeySelectorUtil.getSelectorForKeys(keys,
+				getType(), getExecutionConfig())));
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`KeyedStream` 继承 `DataStream`类，在初始化 `KeyedStream` 对象的时候，需要创建`PartitionTransformation`对象并对其`input`、`partitioner`等重要字段进行赋值。
+```java
+public class KeyedStream<T, KEY> extends DataStream<T> {
+
+    /**
+     * The key selector that can get the key by which the stream if partitioned from the elements.
+     */
+    private final KeySelector<T, KEY> keySelector;
+
+    /** The type of the key by which the stream is partitioned. */
+    private final TypeInformation<KEY> keyType;
+
+    /**
+     * Creates a new {@link KeyedStream} using the given {@link KeySelector}
+     * to partition operator state by key.
+     *
+     * @param dataStream
+     *            Base stream of data
+     * @param keySelector
+     *            Function for determining state partitions
+     */
+    public KeyedStream(DataStream<T> dataStream, KeySelector<T, KEY> keySelector) {
+        this(dataStream, keySelector, TypeExtractor.getKeySelectorTypes(keySelector, dataStream.getType()));
+    }
+
+    /**
+     * Creates a new {@link KeyedStream} using the given {@link KeySelector}
+     * to partition operator state by key.
+     *
+     * @param dataStream
+     *            Base stream of data
+     * @param keySelector
+     *            Function for determining state partitions
+     */
+    public KeyedStream(DataStream<T> dataStream, KeySelector<T, KEY> keySelector, TypeInformation<KEY> keyType) {
+        this(
+            dataStream,
+            new PartitionTransformation<>(
+                dataStream.getTransformation(),
+                new KeyGroupStreamPartitioner<>(keySelector, StreamGraphGenerator.DEFAULT_LOWER_BOUND_MAX_PARALLELISM)),
+                    keySelector,
+                    keyType);
+        }
+    
+        /**
+         * Creates a new {@link KeyedStream} using the given {@link KeySelector} and {@link TypeInformation}
+         * to partition operator state by key, where the partitioning is defined by a {@link Parti    tionTransformation}.
+         *
+         * @param stream
+         *                Base stream of data
+         * @param partiti    onTransformation
+         *            Function that determines how the keys are distributed to downstream operator(s)
+         * @param keySelector
+         *            Function to extract keys from the base stream
+         * @param keyType
+         *            Defines the type of the extracted keys
+         */
+    @Internal
+    KeyedStream(
+        DataStream<T> stream,
+        PartitionTransformation<T> partitionTransformation,
+        KeySelector<T, KEY> keySelector,
+        TypeInformation<KEY> keyType) {
+
+        super(stream.getExecutionEnvironment(), partitionTransformation);
+        this.keySelector = clean(keySelector);
+        this.keyType = validateKeyType(keyType);
+    }
+    ...
+}
+```
+```java
+/**
+ * This transformation represents a change of partitioning of the input elements.
+ *
+ * <p>This does not create a physical operation, it only affects how upstream operations are
+ * connected to downstream operations.
+ *
+ * @param <T> The type of the elements that result from this {@code PartitionTransformation}
+ */
+@Internal
+public class PartitionTransformation<T> extends Transformation<T> {
+
+    private final Transformation<T> input;
+
+    private final StreamPartitioner<T> partitioner;
+
+    private final ShuffleMode shuffleMode;
+
+    ...
+
+    /**
+     * Creates a new {@code PartitionTransformation} from the given input and
+     * {@link StreamPartitioner}.
+     *
+     * @param input The input {@code Transformation}
+     * @param partitioner The {@code StreamPartitioner}
+     * @param shuffleMode The {@code ShuffleMode}
+     */
+    public PartitionTransformation(
+        Transformation<T> input,
+        StreamPartitioner<T> partitioner,
+        ShuffleMode shuffleMode) {
+            super("Partition", input.getOutputType(), input.getParallelism());
+            this.input = input;
+            this.partitioner = partitioner;
+            this.shuffleMode = checkNotNull(shuffleMode);
+        }
+    ...
+}
+```
+> PartitionTransformation 并不会向上面使用到的SourceTransformation、OneInputTransformation一样生成算子节点，其只会影响上游算子到下游算子的连接方式以及上游数据的分发到下游分区的可能情况。
+### sum()
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`sum()`方法是 `KeyedStream` 的成员方法，意味着该方法只能跟在 `keyBy()` 方法的后面，与该方法相似的方法还有很多，比如说`min()`、`max()`、`reduce()`，这里，我们不关注这些方法的内部逻辑，如若需要读者可以前往进行[Flink reduce、sum、aggregate等方法的源码分析](https://juejin.cn/post/6918650930548178958)阅读参考。`sum()`方法内部实际上调用`aggregate()`方法。`SumAggregator`是对聚合后数据求和操作的实现，继承`AggregationFunction`类，间接实现了`ReduceFunction`接口。
+
+```java
+public SingleOutputStreamOperator<T> sum(int positionToSum) {
+    return aggregate(new SumAggregator<>(positionToSum, getType(), getExecutionConfig()));
+}
+```
+```java
+public class SumAggregator<T> extends AggregationFunction<T> {
+    ...
+    public SumAggregator(int pos, TypeInformation<T> typeInfo, ExecutionConfig config) {
+        ...
+    }
+    ...
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`aggregate()`方法首先初始化`StreamGroupedReduce`对象，然后调用`transform()`方法获得当前算子的`DataStream`对象。`transform()`实现于上文所述一致，这里不再赘述。
+```java
+protected SingleOutputStreamOperator<T> aggregate(AggregationFunction<T> aggregate) {
+    StreamGroupedReduce<T> operator = new StreamGroupedReduce<T>(
+			clean(aggregate), getType().createSerializer(getExecutionConfig()));
+    return transform("Keyed Aggregation", getType(), operator);
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`StreamGroupedReduce` 继承 `AbstractUdfStreamOperator` 抽象类，在构造`StreamGroupedReduce`对象的时候，将`aggregate`变量赋值给`AbstractUdfStreamOperator#userFunction`变量，并将对`StreamGroupedReduce`对象的成员变量`TypeSerializer serializer`进行赋值。
+```java
+public class StreamGroupedReduce<IN> extends AbstractUdfStreamOperator<IN, ReduceFunction<IN>>
+		implements OneInputStreamOperator<IN, IN> {
+    ...
+    private TypeSerializer<IN> serializer;
+
+    public StreamGroupedReduce(ReduceFunction<IN> reducer, TypeSerializer<IN> serializer){
+	super(reducer);
+	this.serializer = serializer;
+    }
+    ...
+}
+```
+### addSink()
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`addSink()` 与 `addSource()`方法整体类似。`addSink()`主要完成如下几件事：
+* 生成`StreamSink`对象；
+* 生成 `DataStreamSink` 对象；
+* 将当前算子对应的 `Transformation` 实例添加到 `StreamExecutionEnvironment` 持有的transformations集合中。
+```java
+public DataStreamSink<T> addSink(SinkFunction<T> sinkFunction) {
+
+    // 当前transformation表示上一个算子的Transformation实例，用来检查上一个算子的数据输出类型能否正确推断出来
+    transformation.getOutputType();
+
+    if (sinkFunction instanceof InputTypeConfigurable) {
+        ((InputTypeConfigurable) sinkFunction).setInputType(getType(), getExecutionConfig());
+    }
+
+    StreamSink<T> sinkOperator = new StreamSink<>(clean(sinkFunction));
+
+    DataStreamSink<T> sink = new DataStreamSink<>(this, sinkOperator);
+
+    getExecutionEnvironment().addOperator(sink.getTransformation());
+    return sink;
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`StreamSink` 继承 `AbstractUdfStreamOperator`类，并将变量`sinkFunction`赋值给`userFunction`变量，并设置当前算子的`chainStrategy`为`ChainingStrategy.ALWAYS`。
+```java
+public class StreamSink<IN> extends AbstractUdfStreamOperator<Object, SinkFunction<IN>>
+		implements OneInputStreamOperator<IN, Object> {
+    ...
+    public StreamSink(SinkFunction<IN> sinkFunction) {
+	super(sinkFunction);
+	chainingStrategy = ChainingStrategy.ALWAYS;
+    }
+    ...
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;很意外，`DataStreamSink`并没有继承`DataStream`类，其只有一个成员变量`transformation`以及若干个基础方法，如`name()`、`setParallelism()`等，当然，这也符合现实情况。初始化`DataStreamSink`对象，实际上也是为了对其变量`transformation`进行赋值。
+```java
+@Public
+public class DataStreamSink<T> {
+
+    private final SinkTransformation<T> transformation;
+
+    protected DataStreamSink(DataStream<T> inputStream, StreamSink<T> operator) {
+        this.transformation = new SinkTransformation<T>(inputStream.getTransformation(), "Unnamed", operator, inputStream.getExecutionEnvironment().getParallelism());
+    }
+    ...
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; `SinkTransformation` 同样继承了 `PhysicalTransformation`类，也间接继承了 `Transformation` 抽象类。逻辑与之前类似，这里不做赘述。 
+```java
+public class SinkTransformation<T> extends PhysicalTransformation<Object> {
+
+    private final Transformation<T> input;
+
+    ...
+    public SinkTransformation(
+		Transformation<T> input,
+		String name,
+		StreamSink<T> operator,
+		int parallelism) {
+        this(input, name, SimpleOperatorFactory.of(operator), parallelism);
+    }
+
+    public SinkTransformation(
+		Transformation<T> input,
+		String name,
+		StreamOperatorFactory<Object> operatorFactory,
+		int parallelism) {
+	super(name, TypeExtractor.getForClass(Object.class), parallelism);
+	this.input = input;
+	this.operatorFactory = operatorFactory;
+    }
+	...
+}
+```
+### WordCount任务调用api原理的思维导图
+![](https://p9-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/097f2cf207dd47068b7ecee5987c3199~tplv-k3u1fbpfcp-watermark.image)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;该图是对上述算子源码的总结，可以在阅读源码的时候，结合该图对源码进行理解、记忆。
+## 生成StreamGraph过程阅读
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在这里，我们首先来看下WordCount任务中各个算子下的`Transformation`信息，以及其中的连接关系等。由下图我们可以知道，当前任务包括5个算子，`TransformationID`从1到5，其中，`flatMap`、`sum`、`addSink`底层的 `transformation` 会保存到  `StreamExecutionEnvironment` 对象持有的 `transformations` 变量中。
+![Transformations信息图](https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/c0f00dc71c6e40208c92382083ce3976~tplv-k3u1fbpfcp-watermark.image)
+![](https://p6-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/4ae4891b4aa54aeeb5e89f82e0c1bb90~tplv-k3u1fbpfcp-watermark.image)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`StreamGraph`的生成发生在用户调用`execute()`方法里，通过`getStreamGraph()`获得当前任务的StreamGraph拓扑图。
+```java
+public JobExecutionResult execute(String jobName) throws Exception {
+    Preconditions.checkNotNull(jobName, "Streaming Job name should not be null.");
+
+    return execute(getStreamGraph(jobName));
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在`getStreamGraph()`方法中，我们可以知道实际上是通过`StreamGraphGenerator#generate()`方法获得的。另外，使用`getStreamGraphGenerator()`初始化`StreamGraphGenerator`对象的时候，会将`transformations`等重要变量赋值给`StreamGraphGenerator`对象的变量`transformations`等。`StreamGraph`就是围绕`transformations`变量生成的。接下来，我们主要来看`generate()`方法的实现细节。
+```java
+public StreamGraph getStreamGraph(String jobName, boolean clearTransformations) {
+    StreamGraph streamGraph = getStreamGraphGenerator().setJobName(jobName).generate();
+    if (clearTransformations) {
+        this.transformations.clear();
+    }
+    return streamGraph;
+}
+```
+```java
+private StreamGraphGenerator getStreamGraphGenerator() {
+    ...
+    return new StreamGraphGenerator(transformations, config, checkpointCfg)
+		.setStateBackend(defaultStateBackend)
+		.setChaining(isChainingEnabled)
+		.setUserArtifacts(cacheFile)
+		.setTimeCharacteristic(timeCharacteristic)
+		.setDefaultBufferTimeout(bufferTimeout);
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在`generate()`方法中，首先生成`StreamGraph`对象，初始化用于保存已经遍历到的`transform`的集合`alreadyTransformed`变量，通过for循环遍历`transformations`中的`transformation`变量，完成StreamGraph的构建工作。
+```java
+public StreamGraph generate() {
+    streamGraph = new StreamGraph(executionConfig, checkpointConfig, savepointRestoreSettings);
+    ...
+    alreadyTransformed = new HashMap<>();
+
+    for (Transformation<?> transformation: transformations) {
+        transform(transformation);
+    }
+
+    final StreamGraph builtStreamGraph = streamGraph;
+
+    ...
+    return builtStreamGraph;
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;下面的代码，是生成StreamGraph的核心代码，也是比较难懂的一块。在`transform(transform)`方法中，如果当前`transform`变量之前已经遍历到的话，则直接返回，紧接着，设置并行度并且检查当前`transform`包含的`outputType`变量是否正常等操作。接下来，会根据当前`transform`变量具体实际情况调用`transformXXXX()`方法，而这个`transformXXXX()`方法底层大部分也是递归调用`transform()`方法。
+```java
+private Collection<Integer> transform(Transformation<?> transform) {
+    // 因为采取的是向前递归的方式，当前transform可能在遍历之前tranform的时候已经遍历过并且以及记录在alreadyTransformed集合中，
+    // 因此，可以直接返回。
+    if (alreadyTransformed.containsKey(transform)) {
+        return alreadyTransformed.get(transform);
+    }
+
+    LOG.debug("Transforming " + transform);
+
+    if (transform.getMaxParallelism() <= 0) {
+        // 为当前算子节点设置最大并行度
+        ... 
+    }
+
+    // 如果当前transform的数据输出类型没有推断出来，则直接抛出异常。
+    transform.getOutputType();
+
+    Collection<Integer> transformedIds;
+    if (transform instanceof OneInputTransformation<?, ?>) {
+        transformedIds = transformOneInputTransform((OneInputTransformation<?, ?>) transform);
+    } else if (transform instanceof TwoInputTransformation<?, ?, ?>) {
+        transformedIds = transformTwoInputTransform((TwoInputTransformation<?, ?, ?>) transform);
+    } else if (transform instanceof SourceTransformation<?>) {
+        transformedIds = transformSource((SourceTransformation<?>) transform);
+    } else if (transform instanceof SinkTransformation<?>) {
+        transformedIds = transformSink((SinkTransformation<?>) transform);
+    } else if (transform instanceof UnionTransformation<?>) {
+        transformedIds = transformUnion((UnionTransformation<?>) transform);
+    } else if (transform instanceof SplitTransformation<?>) {
+        transformedIds = transformSplit((SplitTransformation<?>) transform);
+    } else if (transform instanceof SelectTransformation<?>) {
+        transformedIds = transformSelect((SelectTransformation<?>) transform);
+    } else if (transform instanceof FeedbackTransformation<?>) {
+        transformedIds = transformFeedback((FeedbackTransformation<?>) transform);
+    } else if (transform instanceof CoFeedbackTransformation<?>) {
+        transformedIds = transformCoFeedback((CoFeedbackTransformation<?>) transform);
+    } else if (transform instanceof PartitionTransformation<?>) {
+        transformedIds = transformPartition((PartitionTransformation<?>) transform);
+    } else if (transform instanceof SideOutputTransformation<?>) {
+        transformedIds = transformSideOutput((SideOutputTransformation<?>) transform);
+    } else {
+        throw new IllegalStateException("Unknown transformation: " + transform);
+    }
+
+    // 将当前transform添加到alreadyTransformed集合中，如果调用该方法的时候，当前alreadyTransformed集合中包含了该transform，则直接返回即可。
+    if (!alreadyTransformed.containsKey(transform)) {
+        alreadyTransformed.put(transform, transformedIds);
+    }
+
+    // 省略部分是对StreamGraph当前节点做各种配置，如uid、bufferTimeOut等，这里不做扩展介绍
+    ...
+    return transformedIds;
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;首先，来看执行的第一个`transformation`(`OneInputTransformation{id=2, name='Flat Map', outputType=Java Tuple2<String, Integer>, parallelism=8}`)。执行`transformOneInputTransform(transformation)`方法。
+```java
+private <IN, OUT> Collection<Integer> transformOneInputTransform(OneInputTransformation<IN, OUT> transform) {
+
+    // 可以看到，StreamGraph的生成是从当前的节点向前递归迭代生成的。
+    // 返回值是inputIds，顾名思义，记录的是当前transformation的输入transformation的下标。
+    Collection<Integer> inputIds = transform(transform.getInput());
+
+    // 因为当前节点可能在之前的递归迭代中遍历生成SteamNode，可以直接返回当前transform的id了
+    if (alreadyTransformed.containsKey(transform)) {
+        return alreadyTransformed.get(transform);
+    }
+
+    // 获得当前transform的slotSharingGroup，默认是“default”
+    String slotSharingGroup = determineSlotSharingGroup(transform.getSlotSharingGroup(), inputIds);
+    
+    // addOperator() 方法主要 生成StreamNode节点，并对输入输出的数据类型设置序列化器
+    streamGraph.addOperator(transform.getId(),
+                                slotSharingGroup,
+                                transform.getCoLocationGroupKey(),
+                                transform.getOperatorFactory(),
+                                transform.getInputType(),
+                                transform.getOutputType(),
+                                transform.getName());
+
+    if (transform.getStateKeySelector() != null) {
+        TypeSerializer<?> keySerializer = transform.getStateKeyType().createSerializer(executionConfig);
+        streamGraph.setOneInputStateKey(transform.getId(), transform.getStateKeySelector(), keySerializer);    
+    }
+
+    // 为当前StreamNode设置并行度及最大并行度
+    int parallelism = transform.getParallelism() != ExecutionConfig.PARALLELISM_DEFAULT ?
+                            transform.getParallelism() : executionConfig.getParallelism();
+    streamGraph.setParallelism(transform.getId(), parallelism);
+    streamGraph.setMaxParallelism(transform.getId(), transform.getMaxParallelism());
+    
+    // StreamNode之间通过StreamEdge进行连接。当前步骤主要就是通过StreamEdge连接上下游的StreamNode
+    for (Integer inputId: inputIds) {
+        streamGraph.addEdge(inputId, transform.getId(), 0);
+    }
+    // 返回当前遍历的transformId
+    return Collections.singleton(transform.getId());
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;递归遍历第一个算子，也就是调用`transformSource()`方法。与上述过程基本上相似，只不过差异主要体现在`addSource()`方法，我们后续详细介绍。
+```java
+private <T> Collection<Integer> transformSource(SourceTransformation<T> source) {
+    String slotSharingGroup = determineSlotSharingGroup(source.getSlotSharingGroup(), Collections.emptyList());
+    
+    // addSource() 底层调用addOperator()方法
+    streamGraph.addSource(source.getId(),
+                            slotSharingGroup,
+                            source.getCoLocationGroupKey(),
+                            source.getOperatorFactory(),
+                            null,
+                            source.getOutputType(),
+                            "Source: " + source.getName());
+                            
+    if (source.getOperatorFactory() instanceof InputFormatOperatorFactory) {
+        streamGraph.setInputFormat(source.getId(),
+                                        ((InputFormatOperatorFactory<T>) source.getOperatorFactory()).getInputFormat());
+    }
+    
+    int parallelism = source.getParallelism() != ExecutionConfig.PARALLELISM_DEFAULT ?
+                         source.getParallelism() : executionConfig.getParallelism();
+    streamGraph.setParallelism(source.getId(), parallelism);
+    streamGraph.setMaxParallelism(source.getId(), source.getMaxParallelism());
+    return Collections.singleton(source.getId());
+}
+
+public <IN, OUT> void addSource(Integer vertexID,
+                                    @Nullable String slotSharingGroup,
+                                    @Nullable String coLocationGroup,
+                                    StreamOperatorFactory<OUT> operatorFactory,
+                                    TypeInformation<IN> inTypeInfo,
+                                    TypeInformation<OUT> outTypeInfo,
+                                    String operatorName) {
+    addOperator(vertexID, slotSharingGroup, coLocationGroup, operatorFactory, inTypeInfo, outTypeInfo, operatorName);
+    sources.add(vertexID);
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`determineSlotSharingGroup()`方法主要用于获得当前`transform`的`slotSharingGroup`值，默认是`default`。
+```java
+private String determineSlotSharingGroup(String specifiedGroup, Collection<Integer> inputIds) {
+    if (specifiedGroup != null) {
+        return specifiedGroup;
+    } else {
+        String inputGroup = null;
+        // 如果用户并没有指定当前transform的slotSharingGroup，那么其由上游的transform的slot决定的。
+        // 1）如果当前transform是source节点，默认是default
+        // 2）如果当前transform只有一个上游，默认是default
+        // 3）如果当前transform当前有多个上游，如果上游的slotSharingGroup都是一致的话，
+        //    就用这个slotSharingGroup值，否则，为default
+        for (int id: inputIds) {
+            String inputGroupCandidate = streamGraph.getSlotSharingGroup(id);
+            if (inputGroup == null) {
+                inputGroup = inputGroupCandidate;
+            } else if (!inputGroup.equals(inputGroupCandidate)) {
+                return DEFAULT_SLOT_SHARING_GROUP;
+            }
+        }
+        return inputGroup == null ? DEFAULT_SLOT_SHARING_GROUP : inputGroup;
+    }
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;接下来，我们重点看下`addOperator()`方法的实现。该方法主要生成`StreamNode`节点，并对输入输出的数据类型设置序列化器。
+```java
+public <IN, OUT> void addOperator(
+                                    Integer vertexID,
+                                    @Nullable String slotSharingGroup,
+                                    @Nullable String coLocationGroup,
+                                    StreamOperatorFactory<OUT> operatorFactory,
+                                    TypeInformation<IN> inTypeInfo,
+                                    TypeInformation<OUT> outTypeInfo,
+                                    String operatorName) {
+    
+    // 根据当前节点的位置，调用addNode的方法参数也不一致。Source节点传入SourceStreamTask，
+    // 其他则传入OneInputStreamTask。
+    if (operatorFactory.isStreamSource()) {
+        addNode(vertexID, slotSharingGroup, coLocationGroup, SourceStreamTask.class, operatorFactory, operatorName);
+    } else {
+        addNode(vertexID, slotSharingGroup, coLocationGroup, OneInputStreamTask.class, operatorFactory, operatorName);
+    }
+    
+    // 为当前StreamNode的输入输出数据类型设置序列化器
+    TypeSerializer<IN> inSerializer = inTypeInfo != null && !(inTypeInfo instanceof MissingTypeInfo) ? inTypeInfo.createSerializer(executionConfig) : null;
+    
+    TypeSerializer<OUT> outSerializer = outTypeInfo != null && !(outTypeInfo instanceof MissingTypeInfo) ? outTypeInfo.createSerializer(executionConfig) : null;
+
+    setSerializers(vertexID, inSerializer, null, outSerializer);
+
+    if (operatorFactory.isOutputTypeConfigurable() && outTypeInfo != null) {
+        // sets the output type which must be know at StreamGraph creation time
+        operatorFactory.setOutputType(outTypeInfo, executionConfig);
+    }
+
+    if (operatorFactory.isInputTypeConfigurable()) {
+        operatorFactory.setInputType(inTypeInfo, executionConfig);
+    }
+
+    if (LOG.isDebugEnabled()) {
+        LOG.debug("Vertex: {}", vertexID);
+    }
+}
+
+public void setSerializers(Integer vertexID, TypeSerializer<?> in1, TypeSerializer<?> in2, TypeSerializer<?> out) {
+    StreamNode vertex = getStreamNode(vertexID);
+    vertex.setSerializerIn1(in1);
+    vertex.setSerializerIn2(in2);
+    vertex.setSerializerOut(out);
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;跟着上一步，通过下面的代码，我们可以看到`addNode()`方法主要用于根据`transform`信息生成对应的`StreamNode`节点。
+```java
+protected StreamNode addNode(Integer vertexID,
+                                    @Nullable String slotSharingGroup,
+                                    @Nullable String coLocationGroup,
+                                    Class<? extends AbstractInvokable> vertexClass,
+                                    StreamOperatorFactory<?> operatorFactory,
+                                    String operatorName) {
+
+    if (streamNodes.containsKey(vertexID)) {
+        throw new RuntimeException("Duplicate vertexID " + vertexID);
+    }
+
+    StreamNode vertex = new StreamNode(
+                                        vertexID,
+                                        slotSharingGroup,
+                                        coLocationGroup,
+                                        operatorFactory,
+                                        operatorName,
+                                        new ArrayList<OutputSelector<?>>(),
+                                        vertexClass);
+
+    streamNodes.put(vertexID, vertex);
+
+    return vertex;
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`StreamNode`之间通过`StreamEdge`进行连接，`addEdge()`用于连接上下游`StreamNode`，其实际上调用的是`addEdgeInternal()`方法。`addEdgeInternal()`方法会判断当前上游节点是虚拟节点还是说`StreamNode`，并进行递归调用。
+```java
+public void addEdge(Integer upStreamVertexID, Integer downStreamVertexID, int typeNumber) {
+    addEdgeInternal(upStreamVertexID,
+                        downStreamVertexID,
+                        typeNumber,
+                        null,
+                        new ArrayList<String>(),
+                        null,
+                        null);
+}
+
+private void addEdgeInternal(Integer upStreamVertexID,
+                                Integer downStreamVertexID,
+                                int typeNumber,
+                                StreamPartitioner<?> partitioner,
+                                List<String> outputNames,
+                                OutputTag outputTag,
+                                ShuffleMode shuffleMode) {
+    // 三种虚拟节点，我们当前仅介绍virtualPartitionNode，另外两个类似，故不做过多介绍。
+    if (virtualSideOutputNodes.containsKey(upStreamVertexID)) {
+        int virtualId = upStreamVertexID;
+        upStreamVertexID = virtualSideOutputNodes.get(virtualId).f0;
+        if (outputTag == null) {
+            outputTag = virtualSideOutputNodes.get(virtualId).f1;
+        }
+        addEdgeInternal(upStreamVertexID, downStreamVertexID, typeNumber, partitioner, null, outputTag, shuffleMode);
+    } else if (virtualSelectNodes.containsKey(upStreamVertexID)) {
+        int virtualId = upStreamVertexID;
+        upStreamVertexID = virtualSelectNodes.get(virtualId).f0;
+        if (outputNames.isEmpty()) {
+        // selections that happen downstream override earlier selections
+            outputNames = virtualSelectNodes.get(virtualId).f1;
+        }
+        addEdgeInternal(upStreamVertexID, downStreamVertexID, typeNumber, partitioner, outputNames, outputTag, shuffleMode);
+    } else if (virtualPartitionNodes.containsKey(upStreamVertexID)) {
+        // 获取虚拟节点的上游，将虚拟节点的上下游StreamNode进行连接，通过递归调用addEdgeInternal()方法实现。
+        int virtualId = upStreamVertexID;
+        upStreamVertexID = virtualPartitionNodes.get(virtualId).f0;
+        if (partitioner == null) {
+            partitioner = virtualPartitionNodes.get(virtualId).f1;
+        }
+        shuffleMode = virtualPartitionNodes.get(virtualId).f2;
+        // 在本案例中，upStreamVertexID = 6，downStreamVertexID = 4，递归调用addEdgeInternal，
+        // 实际上连接的是StreamNode 2和StreamNode 4节点。
+        addEdgeInternal(upStreamVertexID, downStreamVertexID, typeNumber, partitioner, outputNames, outputTag, shuffleMode);
+    } else {
+        // 根据vertexID获得上下游的StreamNode
+        StreamNode upstreamNode = getStreamNode(upStreamVertexID);
+        StreamNode downstreamNode = getStreamNode(downStreamVertexID);
+        
+        // 显然，在StreamGraph生成期间，确定了StreamNode之间的生成策略
+        // 1、上下游并行度一致，partitioner为ForwardPartitioner
+        // 2、上下游并行度不一致，partitioner为RebalacePartitioner
+        // 3、HASH
+        if (partitioner == null && upstreamNode.getParallelism() == downstreamNode.getParallelism()) {
+            partitioner = new ForwardPartitioner<Object>();
+        } else if (partitioner == null) {
+            partitioner = new RebalancePartitioner<Object>();
+        }
+
+        if (partitioner instanceof ForwardPartitioner) {
+            if (upstreamNode.getParallelism() != downstreamNode.getParallelism()) {
+                throw new UnsupportedOperationException("Forward partitioning does not allow " +
+                    "change of parallelism. Upstream operation: " + upstreamNode + " parallelism: " + upstreamNode.getParallelism() +
+                    ", downstream operation: " + downstreamNode + " parallelism: " + downstreamNode.getParallelism() +
+                    " You must use another partitioning strategy, such as broadcast, rebalance, shuffle or global.");
+            }
+        }
+    
+        if (shuffleMode == null) {
+            shuffleMode = ShuffleMode.UNDEFINED;
+        }
+        // 通过StreamEdge连接上下游的StreamNode
+        StreamEdge edge = new StreamEdge(upstreamNode, downstreamNode, typeNumber, outputNames, partitioner, outputTag, shuffleMode);
+
+        getStreamNode(edge.getSourceId()).addOutEdge(edge);
+        getStreamNode(edge.getTargetId()).addInEdge(edge);
+    }
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;跟完上述的代码，我们可以知道`addSource`、`flatMap`两个算子对应的`StreamNode`已经形成了，并通过`StreamEdge`对象为两者建立了连接。
+<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;接下来，执行的第二个`transformation`(`OneInputTransformation{id=4, name='Keyed Aggregation', outputType=Java Tuple2<String, Integer>, parallelism=8}`)。同样的，其会向前遍历第三个算子`keyBy`，即执行`transformPartition()`方法。对于`keyBy`算子产生的`Transformation`实例，我们会创建一个**virtual node**。
+```java
+private <T> Collection<Integer> transformPartition(PartitionTransformation<T> partition) {
+    // 获得PartitionTransformation上游的Transformation
+    Transformation<T> input = partition.getInput();
+    List<Integer> resultIds = new ArrayList<>();
+    // 同样的，向前遍历transform，获得当前transform的上游transformedIds都有哪些
+    Collection<Integer> transformedIds = transform(input);
+    for (Integer transformedId: transformedIds) {
+        // 针对上游的每一个transformation，都会生成一个VirtualPartitionNode记录。当然VirtualPartitionNode并不是一个具体类，
+        // 其只是一个包含了当前虚拟ID、上游TransformationID以及Partitioner的Map元素，并被保存到virtualPartitionNodes集合中。
+        int virtualId = Transformation.getNewNodeId();
+        streamGraph.addVirtualPartitionNode(
+                        transformedId, virtualId, partition.getPartitioner(),partition.getShuffleMode());
+        resultIds.add(virtualId);
+    }
+
+    return resultIds;
+}
+
+// private Map<Integer, Tuple3<Integer, StreamPartitioner<?>, ShuffleMode>> virtualPartitionNodes;
+public void addVirtualPartitionNode(
+                        Integer originalId,
+                        Integer virtualId,
+                        StreamPartitioner<?> partitioner,
+                        ShuffleMode shuffleMode) {
+
+    if (virtualPartitionNodes.containsKey(virtualId)) {
+        throw new IllegalStateException("Already has virtual partition node with id " + virtualId);
+    }
+
+    virtualPartitionNodes.put(virtualId, new Tuple3<>(originalId, partitioner, shuffleMode));
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;通过对第二个`transformation`的遍历，我们可以知道，对于`keyBy`算子形成的`transformation`，并没有形成`StreamNode`节点，而是形成了包含`virtualId`、上游`transformationId`、`Partitioner`等信息的VirtualPartitionNode记录。
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;接下来，我们遍历最后一个`transformation`（`SinkTransformation{id=5, name='Unnamed', outputType=GenericType<java.lang.Object>, parallelism=12}`）。当前`SinkTransformation`调用的是`transformSink()`方法。
+```java
+private <T> Collection<Integer> transformSink(SinkTransformation<T> sink) {
+    // 递归遍历前一个transform，当然之前已经遍历了，之前返回前一个transformId
+    Collection<Integer> inputIds = transform(sink.getInput());
+    
+    String slotSharingGroup = determineSlotSharingGroup(sink.getSlotSharingGroup(), inputIds);
+    
+    // addSink方法底层调用的是addOperator方法，用于 生成StreamNode节点，并对输入输出的数据类型设置序列化器
+    streamGraph.addSink(sink.getId(),
+                        slotSharingGroup,
+                        sink.getCoLocationGroupKey(),
+                        sink.getOperatorFactory(),
+                        sink.getInput().getOutputType(),
+                        null,
+                        "Sink: " + sink.getName());
+
+    StreamOperatorFactory operatorFactory = sink.getOperatorFactory();
+    if (operatorFactory instanceof OutputFormatOperatorFactory) {
+        streamGraph.setOutputFormat(sink.getId(), ((OutputFormatOperatorFactory) operatorFactory).getOutputFormat());
+    }
+
+    int parallelism = sink.getParallelism() != ExecutionConfig.PARALLELISM_DEFAULT ?
+                                sink.getParallelism() : executionConfig.getParallelism();
+    streamGraph.setParallelism(sink.getId(), parallelism);
+    streamGraph.setMaxParallelism(sink.getId(), sink.getMaxParallelism());
+    
+    // 使用StreamEdge连接当前StreamNode与上游StreamNode
+    for (Integer inputId: inputIds) {
+        streamGraph.addEdge(inputId,
+                            sink.getId(),
+                            0);
+    }
+
+    if (sink.getStateKeySelector() != null) {
+        TypeSerializer<?> keySerializer = sink.getStateKeyType().createSerializer(executionConfig);
+    streamGraph.setOneInputStateKey(sink.getId(), sink.getStateKeySelector(), keySerializer);
+    }
+
+    return Collections.emptyList();
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;经过上面的代码，我们可以获得当前WordeCount的StreamGraph。
+![](https://p6-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/c2fdea7df6a3405a87227ec53e6838f6~tplv-k3u1fbpfcp-watermark.image)

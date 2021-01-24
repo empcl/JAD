@@ -1,0 +1,117 @@
+> 构建StreamExecutionEnvironment对象时，实际上，会通过Java SPI机制找到PipelineExecutorFactory
+
+
+
+```java
+/**
+ * An interface to be implemented by the entity responsible for finding the correct {@link PipelineExecutor} to
+ * execute a given {@link org.apache.flink.api.dag.Pipeline}.
+ */
+@Internal
+public interface PipelineExecutorServiceLoader {
+
+	/**
+	 * Loads the {@link PipelineExecutorFactory} which is compatible with the provided configuration.
+	 * There can be at most one compatible factory among the available ones, otherwise an exception
+	 * will be thrown.
+	 *
+	 * @return a compatible {@link PipelineExecutorFactory}.
+	 * @throws Exception if there is more than one compatible factories, or something went wrong when
+	 * 			loading the registered factories.
+	 */
+	PipelineExecutorFactory getExecutorFactory(final Configuration configuration) throws Exception;
+
+	/**
+	 * Loads and returns a stream of the names of all available executors.
+	 */
+	Stream<String> getExecutorNames();
+}
+
+```
+
+![image-20210124235616150](C:\Users\25211\AppData\Roaming\Typora\typora-user-images\image-20210124235616150.png)
+
+```java
+/**
+ * Class representing the streaming topology. It contains all the information
+ * necessary to build the jobgraph for the execution.
+ */
+@Internal
+public class StreamGraph implements Pipeline {
+    ...
+}
+```
+
+```java
+/**
+ * The entity responsible for executing a {@link Pipeline}, i.e. a user job.
+ */
+@Internal
+public interface PipelineExecutor {
+
+	/**
+	 * Executes a {@link Pipeline} based on the provided configuration and returns a {@link JobClient} which allows to
+	 * interact with the job being executed, e.g. cancel it or take a savepoint.
+	 *
+	 * <p><b>ATTENTION:</b> The caller is responsible for managing the lifecycle of the returned {@link JobClient}. This
+	 * means that e.g. {@code close()} should be called explicitly at the call-site.
+	 *
+	 * @param pipeline the {@link Pipeline} to execute
+	 * @param configuration the {@link Configuration} with the required execution parameters
+	 * @return a {@link CompletableFuture} with the {@link JobClient} corresponding to the pipeline.
+	 */
+	CompletableFuture<? extends JobClient> execute(final Pipeline pipeline, final Configuration configuration) throws Exception;
+}
+```
+
+```java
+/**
+ * An {@link PipelineExecutor} for executing a {@link Pipeline} locally.
+ */
+@Internal
+public class LocalExecutor implements PipelineExecutor {
+    ...
+}
+```
+
+```java
+	public CompletableFuture<? extends JobClient> execute(Pipeline pipeline, Configuration configuration) throws Exception {
+		checkNotNull(pipeline);
+		checkNotNull(configuration);
+
+		Configuration effectiveConfig = new Configuration();
+		effectiveConfig.addAll(this.configuration);
+		effectiveConfig.addAll(configuration);
+
+		// we only support attached execution with the local executor.
+		checkState(configuration.getBoolean(DeploymentOptions.ATTACHED));
+
+		final JobGraph jobGraph = getJobGraph(pipeline, effectiveConfig);
+
+		return PerJobMiniClusterFactory.createWithFactory(effectiveConfig, miniClusterFactory).submitJob(jobGraph);
+	}
+```
+
+```java
+	private JobGraph getJobGraph(Pipeline pipeline, Configuration configuration) {
+		// This is a quirk in how LocalEnvironment used to work. It sets the default parallelism
+		// to <num taskmanagers> * <num task slots>. Might be questionable but we keep the behaviour
+		// for now.
+		if (pipeline instanceof Plan) {
+			Plan plan = (Plan) pipeline;
+			final int slotsPerTaskManager = configuration.getInteger(
+					TaskManagerOptions.NUM_TASK_SLOTS, plan.getMaximumParallelism());
+			final int numTaskManagers = configuration.getInteger(
+					ConfigConstants.LOCAL_NUMBER_TASK_MANAGER, 1);
+
+			plan.setDefaultParallelism(slotsPerTaskManager * numTaskManagers);
+		}
+
+		return FlinkPipelineTranslationUtil.getJobGraph(pipeline, configuration, 1);
+	}
+```
+
+```java
+
+```
+

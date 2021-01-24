@@ -1,0 +1,659 @@
+# Avro学习入门
+## Avro简介
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[Avro](https://avro.apache.org/)是Hadoop的一个数据序列化系统，具有丰富的数据结构，支持二进制序列化方式，用于支持大批量数据交换。Avro使用Json格式来定义schema。schema可以由简单类型（null、boolean、int、long、float、double、bytes、string）与复合类型（record、enum、array、map、union、fixed）数据组成。
+
+## Avro实践
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在本文中，我们以下面的Json格式作为Avro的schema，并以此为例，介绍在Java、Flink与Flink SQL中的使用Demo以及源码跟进。
+```json
+{
+    "namespace": "flink.pojo",
+    "doc": "User Info",
+    "type": "record",
+    "name": "User",
+    "fields": [
+        {"name": "name", "type": "string"},
+        {"name": "age", "type": "int"},
+        {"name": "sex", "type": "boolean"}
+    ]
+}
+```
+## Demo入门
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Avro提供了两种序列化/反序列化对象的方式：`serializeing and deserializing with code generation`与`serializeing and deserializing without code generation`。
+### serializeing and deserializing with code generation
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`serializeing and deserializing with code generation`方式通过schema生成对应的类。可以通过java -jar的方式或者在pom.xml中插入以下插件配置。
+<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;首先来看java -jar方式。用户需要下载`avro-tools-1.8.2.jar`/`avro-1.8.2.jar`两个jar包到指定位置。然后执行下方的语句即可生成类文件。其中，下方语句的最后一个字段表示当前生成的类文件放置的位置。
+```shell
+java -jar avro-tools-1.8.2.jar compile schema User.avsc ./
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;我们再来看看插件配置的方式。在pom.xml中，添加如下插件配置信息，当用户compile当前项目的时候，就会根据`sourceDirectory`指定目录中的所有.avsc文件生成对应的类文件到`outputDirectory`目录中。需要说明的是，schema中`namespace`字段会被解析为package名，`name`字段会被解析为对应的类名。
+```xml
+<plugin>
+    <groupId>org.apache.avro</groupId>
+    <artifactId>avro-maven-plugin</artifactId>
+    <version>1.8.1</version>
+    <executions>
+        <execution>
+            <phase>generate-sources</phase>
+            <goals>
+                <goal>schema</goal>
+            </goals>
+            <configuration>
+                <sourceDirectory>${project.basedir}/avros/</sourceDirectory>
+                <outputDirectory>${project.basedir}/src/main/java/</outputDirectory>
+            </configuration>
+        </execution>
+    </executions>
+</plugin>
+
+<plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-compiler-plugin</artifactId>
+    <configuration>
+        <source>1.8</source>
+        <target>1.8</target>
+    </configuration>
+</plugin>
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;通过上述方式生成的类如下图所示。可以看到User类继承`SpecificRecordBase`，并实现了`SpecificRecord`接口。
+![](https://p9-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/2b4b566e7a2d4ac8a18d100a028599e0~tplv-k3u1fbpfcp-watermark.image)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;以下代码块用于将User对象序列化到磁盘文件中，然后再将磁盘文件中的字节码数据反序列化。
+```java
+public void serializeUser() throws IOException {
+    String path = System.getProperty("user.dir") + "/avros/User.avro";
+    SpecificDatumWriter<User> sdw = new SpecificDatumWriter<>(User.class);
+    DataFileWriter<User> dfw = new DataFileWriter<>(sdw);
+    dfw.create(new User().getSchema(),new File(path));
+
+    User user;
+    for (int i = 0; i < 5; i++) {
+        user = new User("name" + i, i * i);
+        dfw.append(user);
+    }
+
+    dfw.close();
+}
+```
+
+```java
+public void deserializeUser() throws IOException {
+    String path = System.getProperty("user.dir") + "/avros/User.avro";
+    File file = new File(path);
+    SpecificDatumReader<User> sdr = new SpecificDatumReader<>(User.class);
+    DataFileReader<User> dfr = new DataFileReader<User>(file, sdr);
+
+    User user = null;
+
+    while (dfr.hasNext()) {
+        user = dfr.next();
+        System.out.println(user);
+    }
+
+    dfr.close();
+}
+```
+### serializeing and deserializing without code generation
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;与上述方式不同得是，当前方式并不需要根据schema生成类对象，只需要要根据schema信息就可以完成数据的序列化以及反序列化操作。具体代码如下所示：
+```java
+public void serializeUser() throws IOException {
+    String schemaPath = System.getProperty("user.dir") + "/avros/User.avsc";
+    String path = System.getProperty("user.dir") + "/avros/User.avro";
+
+    Schema schema = new Schema.Parser().parse(new File(schemaPath));
+    GenericRecord record = new GenericData.Record(schema);
+    record.put("name", "Alyssa");
+    record.put("age", 12);
+    record.put("sex", false);
+
+    GenericDatumWriter<GenericRecord> gdw = new GenericDatumWriter<GenericRecord>(schema);
+    DataFileWriter<GenericRecord> dfw = new DataFileWriter<>(gdw);
+    dfw.create(schema,new File(path));
+
+    dfw.append(record);
+
+    dfw.close();
+}
+```
+```java
+public static void deserializeUser() throws IOException {
+    String schemaPath = System.getProperty("user.dir") + "/avros/User.avsc";
+    String path = System.getProperty("user.dir") + "/avros/User.avro";
+
+    Schema schema = new Schema.Parser().parse(new File(schemaPath));
+    GenericDatumReader<GenericRecord> gdr = new GenericDatumReader<>(schema);
+    DataFileReader<GenericRecord> dfr = new DataFileReader<GenericRecord>(new File(path), gdr);
+
+    GenericRecord record = null;
+
+    while (dfr.hasNext()) {
+        record = dfr.next(record);
+        System.err.println(record);
+    }
+
+    dfr.close();
+}
+```
+### Avro 复合类型的基本写法
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Avro的schema往往是复合类型，其字段要么是简单类型或者嵌套的复合类型。便于读者及本人在工作中使用便利，在此记录不同种数据类型的基本写法，以作后期参考。
+#### 基本类型
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Avro提供了8种基本数据类型，基本类型是不需要指定属性的。基本数据类型列表如下所示：
+<br/>
+
+| 基本类型    | 说明                                                     |
+| :---------- | :------------------------------------------------------- |
+| __null__    | no value                                                 |
+| __boolean__ | a binary value                                           |
+| __int__     | 32-bit signed integer                                    |
+| __long__    | 64-bit signed integer                                    |
+| __float__   | single precision (32-bit) IEEE 754 floating-point number |
+| __double__  | double precision (64-bit) IEEE 754 floating-point number |
+| __bytes__   | sequence of 8-bit unsigned bytes                         |
+| __string__  | unicode character sequence                               |
+
+#### 复杂类型
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Avro提供了6中复杂类型：records、enums、arrays、maps、unions、fixed。其中records、enums、fixed可以用作schema的type，arrays、maps只能用作为字段的类型，而unions主要用来兼容当前字段的数据类型。
+<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;便于使用records这个复杂类型，我们首先介绍arrays、maps、unions等。
+##### arrays
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; arrays 用于表示当前字段是一个数组，通过items属性指定数组类型，当前字段的默认值通过`,`进行分割。样例如下：
+```json
+{
+  "type": "array",
+  "items" : "string",
+  "default": ["jack","tom"]
+}
+```
+##### maps
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; arrays 用于表示当前字段是一个map映射，通过items指定value的数据类型，key类型固定为string，当前字段的默认值以`:`分为k、v键值对，以`,`分割每组键值对。样例如下：
+```json
+{
+  "type": "map",
+  "items" : "long",
+  "default": {"a" : 1,"b" : 2}
+}
+```
+##### unions
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; unions 用于兼容当前字段的数据类型，支持当前字段能够支持多种数据类型。["null", "string"] 表示当前字段能够要么是个null，要么是个string。需要注意的是，当record中field字段中，往往会将`"null"`类型排在首位，如`["null", "string"]`。
+
+##### records
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; records 在schema中以`record`进行表示。可以将该schema生成对象类。records支持以下若干种属性：
+| 属性          | 说明                                                         |
+| :------------ | :----------------------------------------------------------- |
+| __name__      | a JSON string providing the name of the record (required).   |
+| __namespace__ | a JSON string that qualifies the name                        |
+| __aliases__   | a JSON array of strings, providing alternate names for this record (optional). |
+| __doc__       | a JSON string providing documentation to the user of this schema (optional). |
+| __fields__    | a JSON array, listing fields (required).                     |
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; record类型的avro在`fields`中以数组的方式在指定包含的字段有哪些，每一个字段使用json object进行表示。field中能够指定的属性如下所示：
+| 属性        | 说明                                                         |
+| :---------- | :----------------------------------------------------------- |
+| __name__    | a JSON string providing the name of the field (required).    |
+| __type__    | a schema.                                                    |
+| __doc__     | a JSON string describing this field for users (optional).    |
+| __order__   | specifies how this field impacts sort ordering of this record (optional). Valid values are "ascending" (the default), "descending", or "ignore". |
+| __aliases__ | a JSON array of strings, providing alternate names for this field (optional). |
+
+```json
+{
+ "namespace": "avro.type",
+ "type": "record",
+ "name": "RecordDemo",
+ "aliases": ["RecordAliasesDemo"],
+ "fields": [
+   {"name": "stringField", "type": "string"},
+   {"name": "bytesField", "type": ["null" , "bytes"]},
+   {"name": "booleanField",  "type": "boolean"},
+   {"name": "intField",  "type": "int", "order":"descending"},
+   {"name": "longField",  "type": "long", "aliases": ["longAliasesField"]},
+   {"name": "floatField",  "type": "float" ,"default" : "1234"},
+   {"name": "doubleField",  "type": "double"},
+   {"name": "enumField",  "type": {"type": "enum", "name": "Suit", "symbols" : ["SPADES", "HEARTS", "DIAMONDS", "CLUBS"]}},
+   {"name": "strArrayField", "type": {"type": "array", "items": "string", "defaults": ["jack","tom"]}},
+   {"name": "intArrayField", "type": {"type": "array", "items": "int", "defaults": [1,2,3]}},
+   {"name": "mapField", "type": {"type": "map", "values": "long","defaults":{"a":1,"b":2}}},
+   {"name": "fixedField", "type": {"type": "fixed", "size": 16, "name": "md5"}}
+ ]
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;以`namespace`为package名，以`name`为类名，该schema格式会被拼装成schema字符串，作为parse()的参数使用，并创建Schema对象。生成的类文件如下图所示：
+![](https://p6-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/35d904775e4249019aa642bcdbf552c6~tplv-k3u1fbpfcp-watermark.image)
+
+#### enums
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; enums 在schema中以`enum`进行表示。能够将enums的schema生成枚举类。enums支持以下若干个属性：
+| 属性          | 说明                                                         |
+| :------------ | :----------------------------------------------------------- |
+| __name__      | a JSON string providing the name of the enum (required).     |
+| __namespace__ | a JSON string that qualifies the name                        |
+| __aliases__   | a JSON array of strings, providing alternate names for this enum (optional). |
+| __doc__       | a JSON string providing documentation to the user of this schema (optional). |
+| __symbols__   | a JSON array, listing symbols, as JSON strings (required).   |
+| __default__   | A default value for this enumeration, used during resolution when the reader encounters a symbol from the writer that isn't defined in the reader's schema (optional). |
+
+```json
+{
+  "type": "enum",
+  "namespace": "avro.types",
+  "doc":"enum demo",
+  "name": "EnumDemo",
+  "symbols" : ["SPADES", "HEARTS", "DIAMONDS", "CLUBS"]
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;以`namespace`为package名，以`name`为枚举类名，生成的枚举类如下图所示。
+![](https://p6-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/744d6b06a9894b9f957179fd7969e494~tplv-k3u1fbpfcp-watermark.image)
+#### fixed
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; fixed 在schema中以`fixed`进行表示，根据schema生成指定字节数的类。fixed支持以下若干个属性：
+
+| 属性          | 说明                                                         |
+| :------------ | :----------------------------------------------------------- |
+| __name__      | a string naming this fixed (required).                       |
+| __namespace__ | a JSON string that qualifies the name                        |
+| __aliases__   | a JSON array of strings, providing alternate names for this enum (optional). |
+| __size__      | an integer, specifying the number of bytes per value (required). |
+
+```
+{"type": "fixed", "namespace": "avro.types", "name": "md5", "size": 16}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;以`namespace`为package名，以`name`为类名，其中每个类对象包含固定size的字节数。生成的类文件如下图所示。
+![](https://p6-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/f21de00c51154794840841161c7bbf52~tplv-k3u1fbpfcp-watermark.image)
+# Avro在Flink中的实践
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;本文的源码分析场景是Flink使用Avro序列化数据到Kafka中或者从Kafka反序列化数据。`使用到Flink版本是1.10.1，Kafka版本是2.1.1`。
+<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;本文使用到的Avro schema如下所示：
+```json
+{
+ "namespace": "avro.type",
+ "type": "record",
+ "name": "AvroTest",
+ "fields": [
+   {"name": "uname", "type": "string"},
+   {"name": "usex", "type": "boolean"},
+   {"name": "uage", "type": "int"}
+ ]
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;写入到Kafka中的数据比较简单，有name、sex、age三个字段组成，并且会被封装成Row类型返回。具体实现如下所示：
+```java
+DataStreamSource<Row> sourceStream = env.addSource(new SourceFunction<Row>() {
+    @Override
+    public void run(SourceContext<Row> ctx) throws Exception {
+        Random random = new Random();
+        while (true) {
+            int num = random.nextInt(100);
+            String uname = "name" + num;
+            boolean usex = num % 2 == 0 ? true : false;
+            int age = num;
+
+            ctx.collect(Row.of(uname, usex, age));
+        }
+    }
+
+    @Override
+    public void cancel() {
+
+    }
+});
+```
+## Avro在Flink中的实践及源码分析
+```java
+AvroRowSerializationSchema schema = new AvroRowSerializationSchema(schemaStr);
+FlinkKafkaProducer<Row> kafkaProducer = new FlinkKafkaProducer<>(topic, schema, props);
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;首先来看，Flink将数据进行序列化并写入到Kafka部分。首先，根据Avro schema字符串初始化数据序列化器AvroRowSerializationSchema，然后再创建FlinkKafkaProducer对象。在AvroRowSerializationSchema构造方法中，主要对Avro序列化使用到的schema、datumWriter等变量进行赋值操作。
+```java
+public AvroRowSerializationSchema(String avroSchemaString) {
+    Preconditions.checkNotNull(avroSchemaString, "Avro schema must not be null.");
+    this.recordClazz = null;
+    this.schemaString = avroSchemaString;
+    try {
+        this.schema = new Schema.Parser().parse(avroSchemaString);
+    } catch (SchemaParseException e) {
+        throw new IllegalArgumentException("Could not parse Avro schema string.", e);
+    }
+    this.datumWriter = new GenericDatumWriter<>(schema);
+    this.arrayOutputStream = new ByteArrayOutputStream();
+    this.encoder = EncoderFactory.get().binaryEncoder(arrayOutputStream, null);
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;跟进FlinkKafkaProducer构造方法可以知道，会将`AvroRowSerializationSchema`反序列化器包装成`KeyedSerializationSchemaWrapper`对象。将DataStream中数据写入到Kafka时，实际上调用的是`FlinkKafkaProducer#invoke()`方法。在`invoke()`方法中，利用keyedSchema变量序列化数据。此时，keyedSchema变量实际上是`KeyedSerializationSchemaWrapper`对象。也就是说，`invoke()`方法中序列化数据的操作实际上是调用`AvroRowSerializationSchema#serialize()`来完成的。同时，根据`KeyedSerializationSchemaWrapper`类，我们也可以知道，Flink 将数据写入到Kafka时，会默认将其key按照null进行处理的。
+```java
+public FlinkKafkaProducer(String topicId, SerializationSchema<IN> serializationSchema, Properties producerConfig) {
+    this(
+        topicId,
+        new KeyedSerializationSchemaWrapper<>(serializationSchema),
+        producerConfig,
+        Optional.of(new FlinkFixedPartitioner<IN>()));
+    }
+```
+```java
+public void invoke(FlinkKafkaProducer.KafkaTransactionState transaction, IN next, Context context) throws FlinkKafkaException {
+    ...
+    byte[] serializedKey = keyedSchema.serializeKey(next);
+    byte[] serializedValue = keyedSchema.serializeValue(next);
+    ...
+}
+```
+```java
+public class KeyedSerializationSchemaWrapper<T> implements KeyedSerializationSchema<T> {
+    ...
+    private final SerializationSchema<T> serializationSchema;
+
+    public KeyedSerializationSchemaWrapper(SerializationSchema<T> serializationSchema) {
+        this.serializationSchema = serializationSchema;
+    }
+
+    @Override
+    public byte[] serializeKey(T element) {
+        return null;
+    }
+
+    @Override
+    public byte[] serializeValue(T element) {
+        return serializationSchema.serialize(element);
+    }
+    ...
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;接下来，我们将重点看下`AvroRowSerializationSchema`序列化类是如何将数据序列化成Avro数据格式的。调用`convertRowToAvroRecord()`方法获得经过Avro序列化根据指定schema的记录record，然后将该record写出。
+```java
+public byte[] serialize(Row row) {
+    try {
+        // convert to record
+        final GenericRecord record = convertRowToAvroRecord(schema, row);
+        arrayOutputStream.reset();
+        datumWriter.write(record, encoder);
+        encoder.flush();
+        return arrayOutputStream.toByteArray();
+    } catch (Exception e) {
+        throw new RuntimeException("Failed to serialize row.", e);
+    }
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在`convertRowToAvroRecord()`方法中，获得当前Avro schema中指定的字段，并将每个字段对应的数据（`row.getField(i)`）按照schema下标put到当前记录record中，并返回。Avro schema中字段可以是简单类型，也可以是复杂类型，针对这方面的处理，通过`convertFlinkType()`方法来完成。在`convertFlinkType()`方法中，会判断当前字段类型。对于字段类型是简单类型（如string、bytes、int、long、float、double、boolean、null）要么是经过简单的处理封装，要么就是直接返回。对于字段类型是复杂类型（record、enum、array、map、union）则需要迭代处理当前复杂类型中的每个字段。以字段类型是record为例，其会迭代调用`convertRowToAvroRecord()`方法，直到其内部字段都是简单类型。再来看看字段类型是array的情况，array中每个字段类型都是相同的。通过`final Schema elementSchema = schema.getElementType();`方法获得该字段类型是什么，然后根据数据流中当前下标的数据，迭代调用`convertFlinkType()`方法将数组中的数据封装添加到convertedArray变量并返回。
+```java
+private GenericRecord convertRowToAvroRecord(Schema schema, Row row) {
+    final List<Schema.Field> fields = schema.getFields();
+    final int length = fields.size();
+    final GenericRecord record = new GenericData.Record(schema);
+    for (int i = 0; i < length; i++) {
+        final Schema.Field field = fields.get(i);
+        record.put(i, convertFlinkType(field.schema(), row.getField(i)));
+    }
+    return record;
+}
+```
+```java
+private Object convertFlinkType(Schema schema, Object object) {
+    if (object == null) {
+        return null;
+    }
+    switch (schema.getType()) {
+        case RECORD:
+            if (object instanceof Row) {
+                return convertRowToAvroRecord(schema, (Row) object);
+            }
+            throw new IllegalStateException("Row expected but was: " + object.getClass());
+        case ENUM:
+            return new GenericData.EnumSymbol(schema, object.toString());
+        case ARRAY:
+            final Schema elementSchema = schema.getElementType();
+            final Object[] array = (Object[]) object;
+            final GenericData.Array<Object> convertedArray = new GenericData.Array<>(array.length, schema);
+            for (Object element : array) {
+                convertedArray.add(convertFlinkType(elementSchema, element));
+            }
+            return convertedArray;
+        case MAP:
+            final Map<?, ?> map = (Map<?, ?>) object;
+            final Map<Utf8, Object> convertedMap = new HashMap<>();
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                convertedMap.put(new Utf8(entry.getKey().toString()),
+                convertFlinkType(schema.getValueType(), entry.getValue()));
+            }
+            return convertedMap;
+        case UNION:
+            final List<Schema> types = schema.getTypes();
+            final int size = types.size();
+            final Schema actualSchema;
+            if (size == 2 && types.get(0).getType() == Schema.Type.NULL) {
+                actualSchema = types.get(1);
+            } else if (size == 2 && types.get(1).getType() == Schema.Type.NULL) {
+                actualSchema = types.get(0);
+            } else if (size == 1) {
+                actualSchema = types.get(0);
+            } else {
+                // generic type
+                return object;
+            }
+            return convertFlinkType(actualSchema, object);
+        case FIXED:
+            // check for logical type
+            if (object instanceof BigDecimal) {
+                return new GenericData.Fixed(schema, convertFromDecimal(schema, (BigDecimal) object));
+            }
+            return new GenericData.Fixed(schema, (byte[]) object);
+        case STRING:
+            return new Utf8(object.toString());
+        case BYTES:
+            // check for logical type
+            if (object instanceof BigDecimal) {
+                return ByteBuffer.wrap(convertFromDecimal(schema, (BigDecimal) object));
+            }
+            return ByteBuffer.wrap((byte[]) object);
+        case INT:
+            // check for logical types
+            if (object instanceof Date) {
+                return convertFromDate(schema, (Date) object);
+            } else if (object instanceof Time) {
+                return convertFromTime(schema, (Time) object);
+            }
+            return object;
+        case LONG:
+            // check for logical type
+            if (object instanceof Timestamp) {
+                return convertFromTimestamp(schema, (Timestamp) object);
+            }
+            return object;
+        case FLOAT:
+        case DOUBLE:
+        case BOOLEAN:
+            return object;
+    }
+    throw new RuntimeException("Unsupported Avro type:" + schema);
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;为了更好地理解，Avro将Flink数据流中的数据封装成GenericRecord对象并写出的逻辑。作者根据上述逻辑将方法调用进行了抽象处理，如下图所示：
+![](https://p9-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/55b2c10b9354402094d075987bdd5500~tplv-k3u1fbpfcp-watermark.image)
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;接下来，我们再来看看Flink读取Kafka中的数据并使用Avro反序列化数据。首先，根据Avro schema字符串初始化数据反序列化类AvroRowDeserializationSchema，然后再创建FlinkKafkaConsumer对象。在AvroRowDeserializationSchema构造方法中，主要对Avro反序列化使用到的schema、datumRriter、用于保存Avro数据的record变量等进行赋值操作。
+```java
+AvroRowDeserializationSchema schema = new AvroRowDeserializationSchema(schemaStr);
+FlinkKafkaConsumer<Row> kafkaConsumer = new FlinkKafkaConsumer<Row>(topic, schema, props);
+```
+```java
+public AvroRowDeserializationSchema(String avroSchemaString) {
+    Preconditions.checkNotNull(avroSchemaString, "Avro schema must not be null.");
+    recordClazz = null;
+    final TypeInformation<?> typeInfo = AvroSchemaConverter.convertToTypeInfo(avroSchemaString);
+    Preconditions.checkArgument(typeInfo instanceof RowTypeInfo, "Row type information expected.");
+    this.typeInfo = (RowTypeInfo) typeInfo;
+    schemaString = avroSchemaString;
+    schema = new Schema.Parser().parse(avroSchemaString);
+    record = new GenericData.Record(schema);
+    datumReader = new GenericDatumReader<>(schema);
+    inputStream = new MutableByteArrayInputStream();
+    decoder = DecoderFactory.get().binaryDecoder(inputStream, null);
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Flink读取Kafka中的数据并经过反序列化操作获得Row类型的数据。在这里，对Kafka中的数据进行反序列化操作实际上调用的是`AvroRowDeserializationSchema#deserialize()`方法。在该方法中，首先通过`datumReader.read(record,decoder);`方法将字节数组message解析成Avro的数据类型Record对象，然后，利用`convertAvroRecordToRow()`方法根据avro schema、对应输出的数据类型typeInfo、以及record等信息将Avro格式的数据转为Row类型数据。
+```java
+public Row deserialize(byte[] message) throws IOException {
+    try {
+        inputStream.setBuffer(message);
+        record = datumReader.read(record, decoder);
+        return convertAvroRecordToRow(schema, typeInfo, record);
+    } catch (Exception e) {
+        throw new IOException("Failed to deserialize Avro record.", e);
+    }
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在`convertAvroRecordToRow()`方法中，初始化Row对象，按照每个字段类型，对record中保存的数据进行转换。字段数据的转换操作由`convertAvroType()`方法来完成。`convertAvroType()`包含三个参数：当前字段的avro schema、flink中对应的字段数据类型以及当前字段值。 与上述对数据序列化操作过程类型，会根据schema类型来对当前字段进行直接输出、简单包装或者迭代调用当前方法等处理，这里就不再赘述。该部分的逻辑以图示的方式抽象展现出来，供用户直接参考。
+```java
+private Row convertAvroRecordToRow(Schema schema, RowTypeInfo typeInfo, IndexedRecord record) {
+    final List<Schema.Field> fields = schema.getFields();
+    final TypeInformation<?>[] fieldInfo = typeInfo.getFieldTypes();
+    final int length = fields.size();
+    final Row row = new Row(length);
+    for (int i = 0; i < length; i++) {
+        final Schema.Field field = fields.get(i);
+        row.setField(i, convertAvroType(field.schema(), fieldInfo[i], record.get(i)));
+    }
+    return row;
+}
+```
+```java
+private Object convertAvroType(Schema schema, TypeInformation<?> info, Object object) {
+    // we perform the conversion based on schema information but enriched with pre-computed
+    // type information where useful (i.e., for arrays)
+
+    if (object == null) {
+        return null;
+    }
+    switch (schema.getType()) {
+        case RECORD:
+            if (object instanceof IndexedRecord) {
+                return convertAvroRecordToRow(schema, (RowTypeInfo) info, (IndexedRecord) object);
+            }
+            throw new IllegalStateException("IndexedRecord expected but was: " + object.getClass());
+        case ENUM:
+        case STRING:
+            return object.toString();
+        case ARRAY:
+            if (info instanceof BasicArrayTypeInfo) {
+                final TypeInformation<?> elementInfo = ((BasicArrayTypeInfo<?, ?>) info).getComponentInfo();
+                return convertToObjectArray(schema.getElementType(), elementInfo, object);
+            } else {
+                final TypeInformation<?> elementInfo = ((ObjectArrayTypeInfo<?, ?>) info).getComponentInfo();
+                return convertToObjectArray(schema.getElementType(), elementInfo, object);
+            }
+        case MAP:
+            final MapTypeInfo<?, ?> mapTypeInfo = (MapTypeInfo<?, ?>) info;
+            final Map<String, Object> convertedMap = new HashMap<>();
+            final Map<?, ?> map = (Map<?, ?>) object;
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                convertedMap.put( entry.getKey().toString(),
+                        convertAvroType(schema.getValueType(), mapTypeInfo.getValueTypeInfo(), entry.getValue()));
+            }
+            return convertedMap;
+        case UNION:
+            final List<Schema> types = schema.getTypes();
+            final int size = types.size();
+            final Schema actualSchema;
+            if (size == 2 && types.get(0).getType() == Schema.Type.NULL) {
+                return convertAvroType(types.get(1), info, object);
+            } else if (size == 2 && types.get(1).getType() == Schema.Type.NULL) {
+                return convertAvroType(types.get(0), info, object);
+            } else if (size == 1) {
+                return convertAvroType(types.get(0), info, object);
+            } else {
+                // generic type
+                return object;
+            }
+        case FIXED:
+            final byte[] fixedBytes = ((GenericFixed) object).bytes();
+            if (info == Types.BIG_DEC) {
+                return convertToDecimal(schema, fixedBytes);
+            }
+            return fixedBytes;
+        case BYTES:
+            final ByteBuffer byteBuffer = (ByteBuffer) object;
+            final byte[] bytes = new byte[byteBuffer.remaining()];
+            byteBuffer.get(bytes);
+            if (info == Types.BIG_DEC) {
+                return convertToDecimal(schema, bytes);
+            }
+            return bytes;
+        case INT:
+            if (info == Types.SQL_DATE) {
+                return convertToDate(object);
+            } else if (info == Types.SQL_TIME) {
+                return convertToTime(object);
+            }
+            return object;
+        case LONG:
+            if (info == Types.SQL_TIMESTAMP) {
+                return convertToTimestamp(object);
+            }
+            return object;
+        case FLOAT:
+        case DOUBLE:
+        case BOOLEAN:
+            return object;
+        }
+        throw new RuntimeException("Unsupported Avro type:" + schema);
+}
+```
+![](https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/df59cbf83b9d4eda9f50e5a913490340~tplv-k3u1fbpfcp-watermark.image)
+## Avro在Flink SQL中的实践及源码分析
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;上述场景在Flink SQL中的写法也是大同小异，不过需要指定数据源的Schema。这里不在对底层源码进行深度剖析，主要对Flink SQL写法的简单介绍以及是如何找到使用到的AvroRowSerializationSchema序列化器、AvroDeserializationSchema反序列化器。
+<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Flink SQL从Kafka中读取Avro数据样例如下。这个样例中，我们构建AvroRowDeserializationSchema对象，并且获得数据在Flink中的类型RowTypeInfo，由此构建Flink Schema对象。
+```java
+AvroRowDeserializationSchema avroRowDeserializationSchema = new AvroRowDeserializationSchema(schemaStr);
+RowTypeInfo rowTypeInfo = (RowTypeInfo) avroRowDeserializationSchema.getProducedType();
+String[] fieldNames = rowTypeInfo.getFieldNames();
+TypeInformation<?>[] fieldTypes = rowTypeInfo.getFieldTypes();
+
+Schema schema = new Schema();
+for (int i = 0;i < fieldNames.length;i++) {
+    schema.field(fieldNames[i],fieldTypes[i]);
+}
+
+tEnv.connect(
+    new Kafka()
+        .version("universal")
+        .topic(topic)
+        .startFromLatest()
+        .properties(props))
+    .withFormat(new Avro().avroSchema(schemaStr))
+    .withSchema(schema)
+    .createTemporaryTable("avroTests");
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Flink SQL中将Avro数据写入到Kafka的样例写法如下。读者也许比较好奇，为什么写入Kafka时候，使用了AvroRowDeserializationSchema反序列化类，而不是AvroRowSerializationSchema序列化类。主要是想通过`AvroRowDeserializationSchema#getProducedType()`获得Flink数据类型RowTypeInfo，并以此构建Flink Schema对象。
+```java
+AvroRowDeserializationSchema avroRowDeserializationSchema = new AvroRowDeserializationSchema(schemaStr);
+
+RowTypeInfo rowTypeInfo = (RowTypeInfo) avroRowDeserializationSchema.getProducedType();
+String[] fieldNames = rowTypeInfo.getFieldNames();
+TypeInformation<?>[] fieldTypes = rowTypeInfo.getFieldTypes();
+
+Schema schema = new Schema();
+for (int i = 0;i < fieldNames.length;i++) {
+    schema.field(fieldNames[i],fieldTypes[i]);
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;最后，我们再简单看看Flink SQL 读取 Kafka中Avro数据是如何找到AvroRowDeserializationSchema。上述的样例中，会执行到`KafkaTableSourceSinkFactoryBase#createStreamTableSource()`方法。在这个方法里，调用`getDeserializationSchema()`方法获得AvroRowDeserializationSchema反序列化类。在`getDeserializationSchema()`方法里，首先根据SPI机制找到所有TableFactory并根据properties中`format.type=avro`属性找到AvroRowFormatFactory类。最后，调用`createDeserializationSchema()`方法创建AvroRowDeserializationSchema反序列化类。
+```java
+private DeserializationSchema<Row> getDeserializationSchema(Map<String, String> properties) {
+    @SuppressWarnings("unchecked")
+    final DeserializationSchemaFactory<Row> formatFactory = TableFactoryService.find(
+                                                                DeserializationSchemaFactory.class,
+                                                                properties,
+                                                                this.getClass().getClassLoader());
+    return formatFactory.createDeserializationSchema(properties);
+}
+```
+```java
+public DeserializationSchema<Row> createDeserializationSchema(Map<String, String> properties) {
+    final DescriptorProperties descriptorProperties = getValidatedProperties(properties);
+
+    // create and configure
+    if (descriptorProperties.containsKey(AvroValidator.FORMAT_RECORD_CLASS)) {
+        return new AvroRowDeserializationSchema(
+            descriptorProperties.getClass(AvroValidator.FORMAT_RECORD_CLASS, SpecificRecord.class));
+    } else {
+        return new AvroRowDeserializationSchema(descriptorProperties.getString(AvroValidator.FORMAT_AVRO_SCHEMA));
+    }
+}
+```
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;至此，Avro简单学习入门以及在Flink中的使用样例以及相应的源码剖析已经完毕，整个过程中，学习了很多东西，比如说，Avro 类型到Flink Row类型的转换细节与思想、通过TableFatory工厂类生成具体类的灵活思想等等。Flink除了Avro这个数据类型以外，还提供了Json、CSV等数据类型，其在Flink中的使用以及源码调用方面大同小异，可以借鉴阅读。

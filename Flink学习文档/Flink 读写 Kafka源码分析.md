@@ -205,3 +205,43 @@ public static int assign(KafkaTopicPartition partition, int numParallelSubtasks)
 
 
 
+测试：设置不开setcommitoffsetoncheckpoint会怎么样？
+
+```text
+        // 确保当偏移量的提交模式为ON_CHECKPOINTS(条件1：开启checkpoint，条件2：consumer.setCommitOffsetsOnCheckpoints(true))时，禁用自动提交
+        // 该方法为父类(FlinkKafkaConsumerBase)的静态方法
+        // 这将覆盖用户在properties中配置的任何设置
+        // 当offset的模式为ON_CHECKPOINTS，或者为DISABLED时，会将用户配置的properties属性进行覆盖
+        // 具体是将ENABLE_AUTO_COMMIT_CONFIG = "enable.auto.commit"的值重置为"false
+        // 可以理解为：如果开启了checkpoint，并且设置了consumer.setCommitOffsetsOnCheckpoints(true)，默认为true，
+        // 就会将kafka properties的enable.auto.commit强制置为false
+        adjustAutoCommitConfig(properties, offsetCommitMode);
+```
+
+FlinkKafkaInternalProducer：
+
+FlinkkafkaPartitioner：
+
+FlinkFixedPartitioner：
+
+
+
+
+
+=======================================================================================================
+
+```text
+  public FlinkKafkaConsumer(Pattern subscriptionPattern, DeserializationSchema<T> valueDeserializer, Properties props) {
+        this(null, subscriptionPattern, new KafkaDeserializationSchemaWrapper<>(valueDeserializer), props);
+    }
+```
+
+实际的生产环境中可能有这样一些需求，比如有一个flink作业需要将多种不同的数据聚合到一起，而这些数据对应着不同的kafka topic，随着业务增长，新增一类数据，同时新增了一个kafka topic，如何在不重启作业的情况下作业自动感知新的topic。首先需要在构建FlinkKafkaConsumer时的properties中设置flink.partition-discovery.interval-millis参数为非负值，表示开启动态发现的开关，以及设置的时间间隔。此时FLinkKafkaConsumer内部会启动一个单独的线程定期去kafka获取最新的meta信息。具体的调用执行信息，参见下面的私有构造方法
+
+
+
+
+
+flink 开启 cp + .setcommitoffsetoncheckpoint(true)，提交位点，状态会记录，kafka的zk中也会记录
+
+开启cp + setcommitoffsetoncheckpoint(false)，一个任务消费完后，另一个消费的话，是否会消费之前的数据？
